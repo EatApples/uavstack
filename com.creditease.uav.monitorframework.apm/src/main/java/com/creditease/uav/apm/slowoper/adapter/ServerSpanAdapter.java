@@ -25,10 +25,13 @@ import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.Map;
 
+import javax.servlet.RequestDispatcher;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import javax.servlet.http.HttpServletResponseWrapper;
 
 import com.creditease.agent.helpers.JSONHelper;
+import com.creditease.agent.helpers.ReflectionHelper;
 import com.creditease.monitor.UAVServer;
 import com.creditease.monitor.captureframework.spi.CaptureConstants;
 import com.creditease.uav.apm.RewriteIvcRequestWrapper;
@@ -39,6 +42,7 @@ import com.creditease.uav.apm.invokechain.spi.InvokeChainConstants;
 import com.creditease.uav.apm.invokechain.spi.InvokeChainContext;
 import com.creditease.uav.apm.slowoper.spi.SlowOperConstants;
 import com.creditease.uav.apm.slowoper.spi.SlowOperContext;
+import com.creditease.uav.util.TransformWrapperUtil;
 
 public class ServerSpanAdapter extends InvokeChainAdapter {
 
@@ -94,7 +98,15 @@ public class ServerSpanAdapter extends InvokeChainAdapter {
 
                 RewriteIvcResponseWrapper response = (RewriteIvcResponseWrapper) args[1];
                 slowOperContext.put(SlowOperConstants.PROTOCOL_HTTP_RSP_HEADER, getResponHeaders(response));
-                slowOperContext.put(SlowOperConstants.PROTOCOL_HTTP_RSP_BODY, response.getContent().toString());
+
+                if ((Integer) context.get(CaptureConstants.INFO_APPSERVER_CONNECTOR_RESPONSECODE) == 500) {
+                    String exceptionStr = ((Throwable) request.getAttribute(RequestDispatcher.ERROR_EXCEPTION))
+                            .toString();
+                    slowOperContext.put(SlowOperConstants.PROTOCOL_HTTP_RSP_BODY, exceptionStr);
+                }
+                else {
+                    slowOperContext.put(SlowOperConstants.PROTOCOL_HTTP_RSP_BODY, response.getContent().toString());
+                }
                 response.clearBodyContent();
             }
             else {
@@ -138,8 +150,43 @@ public class ServerSpanAdapter extends InvokeChainAdapter {
     private String getResponHeaders(HttpServletResponse response) {
 
         Map<String, String> result = new HashMap<String, String>();
-        for (String key : response.getHeaderNames()) {
-            result.put(key, response.getHeader(key));
+
+        try {
+            for (String key : response.getHeaderNames()) {
+                result.put(key, response.getHeader(key));
+            }
+        }
+        catch (Error e) {
+            Object resp = response;
+            // 重调用链开启时，获取到原生response
+            if (HttpServletResponseWrapper.class.isAssignableFrom(response.getClass())) {
+                resp = TransformWrapperUtil.moveWrapper("", response);
+            }
+            if (resp == null) {
+                return JSONHelper.toString(result);
+            }
+            // for tomcat 6.0.4x
+            if ("org.apache.catalina.connector.ResponseFacade".equals(resp.getClass().getName())) {
+                resp = ReflectionHelper.getField(resp.getClass(), resp, "response");
+                if (resp == null) {
+                    return JSONHelper.toString(result);
+                }
+
+                String[] headerNames = (String[]) ReflectionHelper.invoke(resp.getClass().getName(), resp,
+                        "getHeaderNames", null, null, response.getClass().getClassLoader());
+                if (headerNames == null) {
+                    return JSONHelper.toString(result);
+                }
+
+                for (String headerName : headerNames) {
+                    String headerValue = (String) ReflectionHelper.invoke(resp.getClass().getName(), resp, "getHeader",
+                            new Class[] { String.class }, new Object[] { headerName },
+                            response.getClass().getClassLoader());
+                    if (headerValue != null) {
+                        result.put(headerName, headerValue);
+                    }
+                }
+            }
         }
         return JSONHelper.toString(result);
     }
